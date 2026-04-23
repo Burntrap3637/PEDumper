@@ -100,13 +100,14 @@ private:
         uint16_t    ordinal;
     };
 
-    bool TouchAllPages(uint64_t base, uint32_t size);
-    bool ReadFull(uint64_t base, std::vector<uint8_t>& out);
-    bool FixSections(std::vector<uint8_t>& pe);
-    void FixHeadersForIDA(std::vector<uint8_t>& pe, uint64_t base);
-    void PatchInt3s(std::vector<uint8_t>& pe);
-    bool RebuildIAT(std::vector<uint8_t>& pe, uint64_t base);
-    void WriteIDAPythonScript(const std::string& outPath, uint64_t base) const;
+    bool     TouchAllPages(uint64_t base, uint32_t size);
+    bool     ReadFull(uint64_t base, std::vector<uint8_t>& out);
+    bool     FixSections(std::vector<uint8_t>& pe);
+    void     FixHeadersForIDA(std::vector<uint8_t>& pe, uint64_t base);
+    void     PatchInt3s(std::vector<uint8_t>& pe);
+    bool     RebuildIAT(std::vector<uint8_t>& pe, uint64_t base);
+    uint32_t DetectRealOEP(const std::vector<uint8_t>& pe, uint64_t base);
+    void     WriteIDAPythonScript(const std::string& outPath, uint64_t base) const;
 
     bool EnumModules(std::vector<ModInfo>& out);
     bool ReadExports(const ModInfo& mod, std::vector<ExportEntry>& out);

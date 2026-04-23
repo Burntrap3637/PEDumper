@@ -44,7 +44,7 @@ static bool OpenDriver(Driver& drv)
     HANDLE h = tryOpen();
     if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND)
     {
-        UI::Info("device not found - loading WinNotify driver...");
+        UI::Info("device not found, loading WinNotify driver");
 
         char exePath[MAX_PATH]{};
         GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -73,7 +73,7 @@ static bool OpenDriver(Driver& drv)
                 return false;
             }
 
-            UI::Sub("service not found - registering...");
+            UI::Sub("service not found, registering");
             svc = CreateServiceA(scm, "WinNotify", "WinNotify",
                 SERVICE_START | SERVICE_QUERY_STATUS,
                 SERVICE_KERNEL_DRIVER,
@@ -135,8 +135,8 @@ static bool AttachToTarget(Driver& drv, const std::string& procName)
     uint64_t cr3 = drv.GetCr3();
     if (cr3 == 0)
     {
-        UI::Err("CR3 bruteforce failed - driver may not be responding to IOCTLs");
-        UI::Sub("confirm driver is loaded and process is not heavily protected at this stage");
+        UI::Err("CR3 bruteforce failed, driver not responding to IOCTLs");
+        UI::Sub("confirm driver is loaded and process is not protected");
         return false;
     }
     UI::Sub("CR3   " + UI::Hex(cr3));
@@ -152,14 +152,14 @@ static bool AttachToTarget(Driver& drv, const std::string& procName)
     uint64_t peb = drv.GetPeb();
     if (!peb)
     {
-        UI::Err("GetPeb() failed - driver IOCTLs may not be working correctly");
+        UI::Err("GetPeb() failed, driver IOCTLs not working");
         return false;
     }
     UI::Sub("PEB   " + UI::Hex(peb));
 
     if (peb > 0x7FFFFFFFFFFF)
     {
-        UI::Err("PEB address looks wrong (" + UI::Hex(peb) + ") - driver may be returning garbage");
+        UI::Err("PEB address looks wrong (" + UI::Hex(peb) + "), driver returning garbage");
         return false;
     }
 
@@ -199,8 +199,8 @@ int main()
     {
         cfg.procName   = "RobloxPlayerBeta.exe";
         cfg.outPath    = "roblox_dump.exe";
-        cfg.oepRva     = 0;
-        cfg.preTouch   = true;
+        cfg.oepRva     = 0x75de50; // WinMain - update after Roblox version changes
+        cfg.preTouch   = false;
         cfg.patchInt3s = true;
         cfg.rebuildIAT = true;
 

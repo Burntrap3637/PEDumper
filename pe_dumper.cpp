@@ -15,22 +15,25 @@ PEDumper::PEDumper(Driver& drv) : m_drv(drv) {}
 
 bool PEDumper::TouchAllPages(uint64_t base, uint32_t size)
 {
-    // shellcode: touch every 0x1000-byte page of [base, base+size) then set done flag
+    // shellcode: touch every 0x1000-byte page of [base, base+size) then spin on done flag
     //   mov rcx, base  /  mov rdx, size  /  xor rax, rax
     //   .loop: movzx r9d, [rcx+rax]  /  add rax, 0x1000  /  cmp rax, rdx  /  jb .loop
-    //   mov rax, <done_flag_va>  /  mov byte [rax], 1  /  ret
-    static constexpr size_t SC_SZ = 54;
+    //   mov rax, <done_flag_va>  /  mov byte [rax], 1  /  jmp $ (spin - context hijack restore)
+    // layout:  [0] 48 B9 [base 8B]  [10] 48 BA [size 8B]  [20] 48 31 C0
+    //          [23] 4C 0F B6 0C 01  [28] 48 05 00 10 00 00  [34] 48 3B C2
+    //          [37] 72 F0  [39] 48 B8 [doneFlagVa 8B]  [49] C6 00 01  [52] EB FE
+    static constexpr size_t SC_SZ = 54; // 53 instruction bytes + 1 done-flag byte
     uint8_t sc[SC_SZ] = {
-        0x48, 0xB9, 0,0,0,0,0,0,0,0,
-        0x48, 0xBA, 0,0,0,0,0,0,0,0,
-        0x48, 0x31, 0xC0,
-        0x4C, 0x0F, 0xB6, 0x0C, 0x01,
-        0x48, 0x05, 0x00, 0x10, 0x00, 0x00,
-        0x48, 0x3B, 0xC2,
-        0x72, 0xF0,
-        0x48, 0xB8, 0,0,0,0,0,0,0,0,
-        0xC6, 0x00, 0x01,
-        0xC3
+        0x48, 0xB9, 0,0,0,0,0,0,0,0,   // [0]  mov rcx, base
+        0x48, 0xBA, 0,0,0,0,0,0,0,0,   // [10] mov rdx, size
+        0x48, 0x31, 0xC0,               // [20] xor rax, rax
+        0x4C, 0x0F, 0xB6, 0x0C, 0x01,  // [23] movzx r9d, [rcx+rax]
+        0x48, 0x05, 0x00, 0x10, 0x00, 0x00, // [28] add rax, 0x1000
+        0x48, 0x3B, 0xC2,               // [34] cmp rax, rdx
+        0x72, 0xF0,                     // [37] jb -16 (.loop)
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,   // [39] mov rax, doneFlagVa
+        0xC6, 0x00, 0x01,               // [49] mov byte [rax], 1
+        0xEB, 0xFE                      // [52] jmp $ (spin until context restored)
     };
     memcpy(sc + 2,  &base, 8);
     uint64_t sz64 = size;
@@ -84,55 +87,27 @@ bool PEDumper::TouchAllPages(uint64_t base, uint32_t size)
 
     if (!caveVa)
     {
-        UI::Warn("no code cave found in executable sections - skipping pre-touch");
+        UI::Warn("no code cave found");
         return false;
     }
 
     uint64_t doneFlagVa = caveVa + SC_SZ;
-    memcpy(sc + 42, &doneFlagVa, 8);
+    memcpy(sc + 41, &doneFlagVa, 8);
 
     uint8_t zero = 0;
     m_drv.Write(doneFlagVa, &zero, 1);
 
     if (!m_drv.Write(caveVa, sc, SC_SZ))
     {
-        UI::Warn("kernel write to cave at " + UI::Hex(caveVa) + " failed");
+        UI::Warn("cave write failed " + UI::Hex(caveVa));
         return false;
     }
-    UI::Sub("cave at " + UI::Hex(caveVa) + "  (" + std::to_string(SC_SZ) + " bytes written)");
+    UI::Sub("cave at " + UI::Hex(caveVa));
 
-    // CFG bypass: redirect the guard dispatch pointer to a jmp rax gadget so the
-    // kernel APC dispatcher's indirect call isn't blocked. restore immediately after.
-    // offsets valid for version-689e359b09ad43b0
-    static constexpr uint64_t OFF_CFG_DISPATCH = 0x187290;
-    static constexpr uint64_t OFF_JMP_RAX      = 0xCD9600;
-
-    uint64_t patchAddr    = base + OFF_CFG_DISPATCH;
-    uint64_t jmpRaxVa     = base + OFF_JMP_RAX;
-    uint64_t origDispatch = m_drv.Read<uint64_t>(patchAddr);
-
-    bool cfgPatched = m_drv.Write(patchAddr, &jmpRaxVa, sizeof(jmpRaxVa));
-    if (cfgPatched)
-        UI::Sub("CFG dispatch: " + UI::Hex(patchAddr) + " -> " + UI::Hex(jmpRaxVa));
-    else
-        UI::Warn("CFG dispatch patch failed (err " + std::to_string(GetLastError()) +
-                 ") - APC may terminate process");
-
-    typedef NTSTATUS (NTAPI *pNtQueueApcThread)(HANDLE, PVOID, PVOID, PVOID, PVOID);
-    auto pfnQueueApc = reinterpret_cast<pNtQueueApcThread>(
-        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueueApcThread"));
-
-    if (!pfnQueueApc)
-    {
-        UI::Warn("NtQueueApcThread not found in ntdll");
-        m_drv.Write(caveVa, savedBytes.data(), SC_SZ);
-        return false;
-    }
-
+    // enumerate target threads sorted by creation time
     DWORD pid = m_drv.ProcessId;
     struct TInfo { DWORD tid; ULONGLONG createTime; };
     std::vector<TInfo> threads;
-
     {
         HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (hSnap != INVALID_HANDLE_VALUE)
@@ -157,83 +132,76 @@ bool PEDumper::TouchAllPages(uint64_t base, uint32_t size)
             CloseHandle(hSnap);
         }
     }
-
     std::sort(threads.begin(), threads.end(),
         [](const TInfo& a, const TInfo& b) { return a.createTime < b.createTime; });
 
-    // skip thread[0] (main - blocks render, triggers Hyperion heartbeat)
-    // target threads[1..8] (early workers, enter alertable waits)
-    // newest threads are Hyperion's watchdogs - don't touch them
-    UI::Sub("found " + std::to_string(threads.size()) +
-            " thread(s)  oldest TID=" + std::to_string(threads.empty() ? 0 : threads[0].tid));
+    UI::Sub("found " + std::to_string(threads.size()) + " threads");
 
-    int queued = 0;
-
-    for (int i = 1; i < (int)threads.size() && i <= 8; i++)
+    bool ran = false;
+    int tcount = (int)threads.size();
+    int tstart = tcount > 16 ? tcount / 4 : 1;   // skip first quarter (init threads)
+    int tend   = tcount > 16 ? tcount / 2 : min(tcount, 9); // use middle range only
+    for (int i = tstart; i < tend && !ran; i++)
     {
-        HANDLE ht = OpenThread(THREAD_SET_CONTEXT, FALSE, threads[i].tid);
+        HANDLE ht = OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+            FALSE, threads[i].tid);
         if (!ht || ht == INVALID_HANDLE_VALUE) continue;
 
-        NTSTATUS st = pfnQueueApc(ht, reinterpret_cast<PVOID>(caveVa),
-                                  nullptr, nullptr, nullptr);
-        UI::Sub("TID " + std::to_string(threads[i].tid) + "  [worker]  " +
-                (st == 0 ? "queued" : "NTSTATUS=" + UI::Hex((uint32_t)st)));
-        if (st == 0) queued++;
-        CloseHandle(ht);
-    }
+        if (SuspendThread(ht) == (DWORD)-1) { CloseHandle(ht); continue; }
 
-    if (!queued && !threads.empty())
-    {
-        UI::Warn("worker threads denied - falling back to main thread (brief freeze expected)");
-        HANDLE ht = OpenThread(THREAD_SET_CONTEXT, FALSE, threads[0].tid);
-        if (ht && ht != INVALID_HANDLE_VALUE)
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_ALL;
+        if (!GetThreadContext(ht, &ctx))
         {
-            NTSTATUS st = pfnQueueApc(ht, reinterpret_cast<PVOID>(caveVa),
-                                      nullptr, nullptr, nullptr);
-            UI::Sub("TID " + std::to_string(threads[0].tid) + "  [main]  " +
-                    (st == 0 ? "queued" : "NTSTATUS=" + UI::Hex((uint32_t)st)));
-            if (st == 0) queued++;
+            ResumeThread(ht);
             CloseHandle(ht);
+            continue;
         }
-    }
 
-    if (!queued)
-    {
-        UI::Warn("could not queue APC to any thread");
-        m_drv.Write(caveVa, savedBytes.data(), SC_SZ);
-        if (cfgPatched) m_drv.Write(patchAddr, &origDispatch, sizeof(origDispatch));
-        return false;
-    }
-
-    UI::Ok("APC queued to " + std::to_string(queued) + " thread(s) - polling (max 3s)...");
-
-    static constexpr int POLL_MS    = 25;
-    static constexpr int TIMEOUT_MS = 3000;
-    bool apcRan = false;
-    for (int elapsed = 0; elapsed < TIMEOUT_MS; elapsed += POLL_MS)
-    {
-        Sleep(POLL_MS);
-        uint8_t flag = 0;
-        m_drv.Read(doneFlagVa, &flag, 1);
-        if (flag)
+        CONTEXT savedCtx = ctx;
+        ctx.Rip = caveVa;
+        if (!SetThreadContext(ht, &ctx))
         {
-            UI::Ok("APC completed in ~" + std::to_string(elapsed + POLL_MS) + "ms");
-            apcRan = true;
-            break;
+            ResumeThread(ht);
+            CloseHandle(ht);
+            continue;
         }
-    }
-    if (!apcRan)
-        UI::Warn("APC did not complete within timeout - thread may not be alertable");
 
-    if (cfgPatched)
-    {
-        m_drv.Write(patchAddr, &origDispatch, sizeof(origDispatch));
-        UI::Sub("CFG dispatch restored");
+        ResumeThread(ht);
+        UI::Sub("TID " + std::to_string(threads[i].tid) + " hijacked");
+
+        static constexpr int POLL_MS    = 25;
+        static constexpr int TIMEOUT_MS = 5000;
+        for (int elapsed = 0; elapsed < TIMEOUT_MS; elapsed += POLL_MS)
+        {
+            Sleep(POLL_MS);
+            uint8_t flag = 0;
+            m_drv.Read(doneFlagVa, &flag, 1);
+            if (flag)
+            {
+                UI::Ok("pre-touch done in ~" + std::to_string(elapsed + POLL_MS) + "ms");
+                ran = true;
+                break;
+            }
+        }
+
+        // restore thread context regardless of whether shellcode completed
+        SuspendThread(ht);
+        SetThreadContext(ht, &savedCtx);
+        ResumeThread(ht);
+        CloseHandle(ht);
+
+        if (!ran)
+            UI::Warn("TID " + std::to_string(threads[i].tid) + " timeout context restored");
     }
+
+    if (!ran)
+        UI::Warn("pre-touch skipped no threads completed");
 
     m_drv.Write(caveVa, savedBytes.data(), savedBytes.size());
     UI::Sub("cave restored");
-    return true;
+    return ran;
 }
 
 bool PEDumper::Dump(uint64_t base, uint32_t oepRva, const std::string& outPath,
@@ -262,9 +230,9 @@ bool PEDumper::Dump(uint64_t base, uint32_t oepRva, const std::string& outPath,
             CloseHandle(hProc);
             if (exitCode != STILL_ACTIVE)
             {
-                UI::Err("target process has exited (code " + std::to_string(exitCode) +
-                        ") - Hyperion likely killed it during the CFG patch window");
-                UI::Sub("try again: re-run dumper after Roblox has fully loaded in-game");
+                UI::Err("target process exited (code " + std::to_string(exitCode) +
+                        "), Hyperion likely killed it");
+                UI::Sub("re-run after Roblox has fully loaded in-game");
                 return false;
             }
         }
@@ -278,12 +246,15 @@ bool PEDumper::Dump(uint64_t base, uint32_t oepRva, const std::string& outPath,
     if (doPatchInt3s) PatchInt3s(pe);
     if (doRebuildIAT) RebuildIAT(pe, base);
 
+    if (!oepRva)
+        oepRva = DetectRealOEP(pe, base);
+
     if (oepRva)
     {
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pe.data());
         auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + dos->e_lfanew);
         nt->OptionalHeader.AddressOfEntryPoint = oepRva;
-        UI::Ok("OEP set to RVA " + UI::Hex(oepRva));
+        UI::Ok("OEP -> RVA " + UI::Hex(oepRva));
     }
 
     std::ofstream f(outPath, std::ios::binary);
@@ -433,7 +404,7 @@ def apply_comments():
 
 apply_imports()
 apply_comments()
-print("[pedumper] done - run apply_imports() again if IDA reanalyzed")
+print("[pedumper] done, run apply_imports() again if IDA reanalyzed")
 )";
 
     UI::Ok("IDAPython script -> " + scriptPath +
@@ -741,6 +712,155 @@ uint64_t PEDumper::FollowTrampoline(uint64_t va, uint64_t moduleBase, uint32_t m
     return 0;
 }
 
+uint32_t PEDumper::DetectRealOEP(const std::vector<uint8_t>& pe, uint64_t base)
+{
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(pe.data());
+    auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS64*>(pe.data() + dos->e_lfanew);
+
+    uint32_t epRva     = nt->OptionalHeader.AddressOfEntryPoint;
+    uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
+    if (!epRva) return 0;
+
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    bool inTempest = false;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        const char* name = reinterpret_cast<const char*>(sec[i].Name);
+        if (strncmp(name, "tempest", 7) == 0)
+        {
+            uint32_t s = sec[i].VirtualAddress;
+            uint32_t e = s + sec[i].Misc.VirtualSize;
+            if (epRva >= s && epRva < e) { inTempest = true; break; }
+        }
+    }
+    if (!inTempest) return 0;
+
+    uint32_t epOff = RvaToOffset(pe, epRva);
+    if (!epOff || epOff + 32 > pe.size()) return 0;
+    const uint8_t* b = pe.data() + epOff;
+
+    uint64_t targetVa = 0;
+
+    // 48 B8 [imm64] FF E0   =>  mov rax, imm64 / jmp rax
+    if (b[0] == 0x48 && b[1] == 0xB8 && b[10] == 0xFF && b[11] == 0xE0)
+        memcpy(&targetVa, b + 2, 8);
+    // 68 [lo32] C7 44 24 04 [hi32] C3   =>  push lo; mov [rsp+4], hi; ret
+    else if (b[0] == 0x68 && b[5] == 0xC7 && b[6] == 0x44 && b[7] == 0x24 && b[8] == 0x04 && b[13] == 0xC3)
+    {
+        uint32_t lo, hi;
+        memcpy(&lo, b + 1, 4);
+        memcpy(&hi, b + 9, 4);
+        targetVa = (static_cast<uint64_t>(hi) << 32) | lo;
+    }
+    // E9 [rel32]   =>  jmp rel32
+    else if (b[0] == 0xE9)
+    {
+        int32_t rel;
+        memcpy(&rel, b + 1, 4);
+        targetVa = (base + epRva) + 5 + static_cast<uint64_t>(static_cast<int64_t>(rel));
+    }
+    // FF 25 [disp32]   =>  jmp [rip+disp32]
+    else if (b[0] == 0xFF && b[1] == 0x25)
+    {
+        int32_t disp;
+        memcpy(&disp, b + 2, 4);
+        uint64_t ptrVa = (base + epRva) + 6 + static_cast<uint64_t>(static_cast<int64_t>(disp));
+        if (ptrVa > base && ptrVa - base < imageSize)
+        {
+            uint32_t ptrOff = RvaToOffset(pe, static_cast<uint32_t>(ptrVa - base));
+            if (ptrOff && ptrOff + 8 <= pe.size())
+                memcpy(&targetVa, pe.data() + ptrOff, 8);
+        }
+    }
+
+    if (targetVa && targetVa > base && targetVa < base + imageSize)
+    {
+        uint32_t rva = static_cast<uint32_t>(targetVa - base);
+        UI::Ok("OEP auto-detected: RVA " + UI::Hex(rva) + " (tempest stub target)");
+        return rva;
+    }
+
+    // strategy 2: find WinMain by locating the function that calls GetCommandLineA/W
+    // works for Hyperion where the tempest stub jumps to Windows CRT, not directly to OEP
+    uint32_t cmdLineSlotRva = 0;
+    for (auto& slot : m_importSlots)
+    {
+        std::string fn = slot.func;
+        if (!fn.empty() && fn[0] == '~') fn = fn.substr(1);
+        if (fn == "GetCommandLineA" || fn == "GetCommandLineW")
+        {
+            cmdLineSlotRva = slot.rva;
+            break;
+        }
+    }
+
+    if (!cmdLineSlotRva)
+    {
+        UI::Warn("OEP detection: GetCommandLineA/W not in resolved imports, skipping scan");
+        return 0;
+    }
+
+    // find the first code section to scan
+    auto* dos2 = reinterpret_cast<const IMAGE_DOS_HEADER*>(pe.data());
+    auto* nt2  = reinterpret_cast<const IMAGE_NT_HEADERS64*>(pe.data() + dos2->e_lfanew);
+    auto* sec2 = IMAGE_FIRST_SECTION(nt2);
+
+    uint32_t textOff = 0, textEnd = 0;
+    for (int i = 0; i < nt2->FileHeader.NumberOfSections; i++)
+    {
+        if (sec2[i].Characteristics & IMAGE_SCN_CNT_CODE)
+        {
+            textOff = sec2[i].PointerToRawData;
+            textEnd = sec2[i].PointerToRawData + sec2[i].SizeOfRawData;
+            break;
+        }
+    }
+
+    if (!textOff || textEnd <= textOff) return 0;
+
+    const uint8_t* buf2 = pe.data();
+    uint32_t       hits = 0;
+    uint32_t       oepRva = 0;
+
+    for (uint32_t i = textOff; i + 6 <= textEnd; i++)
+    {
+        if (buf2[i] != 0xFF || buf2[i + 1] != 0x15) continue;
+        int32_t disp;
+        memcpy(&disp, buf2 + i + 2, 4);
+        uint32_t instrRva = i; // offset == rva after FixSections
+        uint32_t refRva   = instrRva + 6 + static_cast<uint32_t>(static_cast<int64_t>(disp));
+        if (refRva != cmdLineSlotRva) continue;
+
+        // walk backwards up to 4KB to find function start (INT3/NOP/zero padding boundary)
+        uint32_t limit = (i > 0x1000) ? i - 0x1000 : textOff;
+        uint32_t fnOff = i;
+        for (uint32_t j = i; j > limit + 4; j--)
+        {
+            uint8_t p0 = buf2[j], p1 = buf2[j-1], p2 = buf2[j-2], p3 = buf2[j-3];
+            bool isPad = (p0 == 0xCC || p0 == 0x90 || p0 == 0x00) &&
+                         (p1 == 0xCC || p1 == 0x90 || p1 == 0x00) &&
+                         (p2 == 0xCC || p2 == 0x90 || p2 == 0x00) &&
+                         (p3 == 0xCC || p3 == 0x90 || p3 == 0x00);
+            if (isPad)
+            {
+                uint32_t after = j + 1;
+                while (after < i && (buf2[after] == 0xCC || buf2[after] == 0x90 || buf2[after] == 0x00))
+                    after++;
+                fnOff = (after + 15) & ~15u; // snap to 16-byte alignment
+                break;
+            }
+        }
+
+        hits++;
+        oepRva = fnOff;
+        UI::Ok("OEP auto-detected: RVA " + UI::Hex(oepRva) + " (GetCommandLine scan, hit " + std::to_string(hits) + ")");
+
+        if (hits == 1) break; // take the first match - WinMain calls it first
+    }
+
+    return oepRva;
+}
+
 bool PEDumper::RebuildIAT(std::vector<uint8_t>& pe, uint64_t base)
 {
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pe.data());
@@ -887,7 +1007,7 @@ bool PEDumper::RebuildIAT(std::vector<uint8_t>& pe, uint64_t base)
 
         if (groups.empty())
         {
-            UI::Warn("directory slots didn't resolve - likely stub-redirected IAT");
+            UI::Warn("directory slots didn't resolve, likely stub-redirected IAT");
             int shown = 0;
             for (auto& slot : slots)
             {
@@ -915,7 +1035,7 @@ bool PEDumper::RebuildIAT(std::vector<uint8_t>& pe, uint64_t base)
         }
 
         if (hasHyperion)
-            UI::Warn("Hyperion/Byfron detected - IAT is intentionally wiped at load time");
+            UI::Warn("Hyperion/Byfron detected, IAT intentionally wiped at load time");
 
         UI::Info("scanning full image for FF15/48FF25 patterns (Vulkan method)...");
 
